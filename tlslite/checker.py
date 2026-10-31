@@ -3,7 +3,7 @@
 
 """Class for post-handshake certificate checking."""
 
-from .x509 import X509
+from .x509 import X509, RawPublicKey
 from .x509certchain import X509CertChain
 from .errors import *
 
@@ -19,17 +19,20 @@ class Checker(object):
     :py:class:`tlslite.errors.TLSAuthenticationError`
     will be raised.
 
-    Currently, the Checker can check an X.509 chain.
+    Currently, the Checker can check an X.509 chain or a raw public key
+    (as defined in RFC 7250).
     """
 
     def __init__(self,
                  x509Fingerprint=None,
-                 checkResumedSession=False):
+                 checkResumedSession=False,
+                 spkiFingerprint=None):
         """
         Create a new Checker instance.
 
         You must pass in one of these argument combinations:
          - x509Fingerprint
+         - spkiFingerprint
 
         :param str x509Fingerprint: A hex-encoded X.509 end-entity
             fingerprint which the other party's end-entity certificate must
@@ -39,10 +42,15 @@ class Checker(object):
             checked.  This defaults to False, on the theory that if the
             session was checked once, we don't need to bother
             re-checking it.
+
+        :param str spkiFingerprint: A hex-encoded SHA-256 fingerprint of
+            the other party's SubjectPublicKeyInfo DER encoding (the raw
+            public key as negotiated per RFC 7250) which it must match.
         """
 
         self.x509Fingerprint = x509Fingerprint
         self.checkResumedSession = checkResumedSession
+        self.spkiFingerprint = spkiFingerprint
 
     def __call__(self, connection):
         """Check a TLSConnection.
@@ -59,7 +67,7 @@ class Checker(object):
         if not self.checkResumedSession and connection.resumed:
             return
 
-        if self.x509Fingerprint:
+        if self.x509Fingerprint or self.spkiFingerprint:
             if connection._client:
                 chain = connection.session.serverCertChain
             else:
@@ -72,6 +80,19 @@ class Checker(object):
                             raise TLSFingerprintError(\
                                 "X.509 fingerprint mismatch: %s, %s" % \
                                 (chain.getFingerprint(), self.x509Fingerprint))
+                elif chain:
+                    raise TLSAuthenticationTypeError()
+                else:
+                    raise TLSNoAuthenticationError()
+            else:
+                # RFC 7250: identity of a raw public key is established
+                # out-of-band, here via its SPKI SHA-256 fingerprint
+                if isinstance(chain, X509CertChain) and chain.x509List and \
+                        isinstance(chain.x509List[0], RawPublicKey):
+                    if chain.getFingerprint() != self.spkiFingerprint:
+                        raise TLSFingerprintError(\
+                            "SPKI fingerprint mismatch: %s, %s" % \
+                            (chain.getFingerprint(), self.spkiFingerprint))
                 elif chain:
                     raise TLSAuthenticationTypeError()
                 else:

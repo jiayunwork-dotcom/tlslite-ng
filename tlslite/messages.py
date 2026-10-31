@@ -15,7 +15,7 @@ from .utils.cryptomath import *
 from .errors import *
 from .utils.codec import *
 from .constants import *
-from .x509 import X509
+from .x509 import X509, RawPublicKey
 from .x509certchain import X509CertChain
 from .utils.tackwrapper import *
 from .utils.deprecations import deprecated_attrs, deprecated_params
@@ -308,6 +308,78 @@ class HelloMessage(HandshakeMsg):
         else:
             self._removeExt(extType)
 
+    @property
+    def server_certificate_type(self):
+        """
+        Return the server certificate type selected by the server (RFC 7250).
+
+        Absence of the extension means X.509 (the default).
+
+        :rtype: int
+        """
+        cert_type = self.getExtension(ExtensionType.server_certificate_type)
+        if cert_type is None:
+            return CertificateType.x509
+        return cert_type.cert_type
+
+    @server_certificate_type.setter
+    def server_certificate_type(self, val):
+        """
+        Set the selected server certificate type.
+
+        X.509 (the default) is not signalled on the wire, the extension is
+        sent only for types other than X.509.
+
+        :type val: int
+        :param val: type of certificate
+        """
+        if val == CertificateType.x509 or val is None:
+            self._removeExt(ExtensionType.server_certificate_type)
+            return
+
+        cert_type = self.getExtension(ExtensionType.server_certificate_type)
+        if cert_type is None:
+            ext = SrvServerCertificateTypeExtension().create(val)
+            self.addExtension(ext)
+        else:
+            cert_type.cert_type = val
+
+    @property
+    def client_certificate_type(self):
+        """
+        Return the client certificate type selected by the server (RFC 7250).
+
+        Absence of the extension means X.509 (the default).
+
+        :rtype: int
+        """
+        cert_type = self.getExtension(ExtensionType.client_certificate_type)
+        if cert_type is None:
+            return CertificateType.x509
+        return cert_type.cert_type
+
+    @client_certificate_type.setter
+    def client_certificate_type(self, val):
+        """
+        Set the selected client certificate type.
+
+        X.509 (the default) is not signalled on the wire, the extension is
+        sent only for types other than X.509.
+
+        :type val: int
+        :param val: type of certificate
+        """
+        if val == CertificateType.x509 or val is None:
+            self._removeExt(ExtensionType.client_certificate_type)
+            return
+
+        cert_type = self.getExtension(ExtensionType.client_certificate_type)
+        if cert_type is None:
+            ext = SrvClientCertificateTypeExtension().create(val)
+            self.addExtension(ext)
+        else:
+            cert_type.cert_type = val
+
 
 class ClientHello(HelloMessage):
     """
@@ -417,6 +489,71 @@ class ClientHello(HelloMessage):
 
         if cert_type is None:
             ext = ClientCertTypeExtension().create(val)
+            self.addExtension(ext)
+        else:
+            cert_type.certTypes = val
+
+    @property
+    def server_certificate_types(self):
+        """
+        Return the list of server certificate types accepted by the client,
+        in preference order (RFC 7250).
+
+        Absence of the extension means only X.509 (the default).
+
+        :rtype: list of int
+        """
+        cert_type = self.getExtension(
+            ExtensionType.server_certificate_type)
+        if cert_type is None:
+            return [CertificateType.x509]
+        return cert_type.certTypes
+
+    @server_certificate_types.setter
+    def server_certificate_types(self, val):
+        """
+        Set the list of accepted server certificate types (RFC 7250).
+
+        :type val: list
+        :param val: list of certificate type identifiers in preference order
+        """
+        cert_type = self.getExtension(
+            ExtensionType.server_certificate_type)
+        if cert_type is None:
+            ext = ServerCertificateTypeExtension().create(val)
+            self.addExtension(ext)
+        else:
+            cert_type.certTypes = val
+
+    @property
+    def client_certificate_types(self):
+        """
+        Return the list of client certificate types the client is willing
+        to send, in preference order (RFC 7250).
+
+        Absence of the extension means only X.509 (the default).
+
+        :rtype: list of int
+        """
+        cert_type = self.getExtension(
+            ExtensionType.client_certificate_type)
+        if cert_type is None:
+            return [CertificateType.x509]
+        return cert_type.certTypes
+
+    @client_certificate_types.setter
+    def client_certificate_types(self, val):
+        """
+        Set the list of client certificate types the client can send
+        (RFC 7250).
+
+        :type val: list
+        :param val: list of certificate type identifiers in preference order
+        """
+        cert_type = self.getExtension(
+            ExtensionType.client_certificate_type)
+        if cert_type is None:
+            ext = ClientCertificateTypeExtension().create(val)
             self.addExtension(ext)
         else:
             cert_type.certTypes = val
@@ -1079,7 +1216,8 @@ class CertificateEntry(object):
     def write(self):
         """Serialise the object."""
         writer = Writer()
-        if self.certificateType == CertificateType.x509:
+        if self.certificateType in (CertificateType.x509,
+                                    CertificateType.raw_public_key):
             writer.addVarSeq(self.certificate.writeBytes(), 1, 3)
         else:
             raise ValueError("Set certificate type ({0}) unsupported"
@@ -1099,6 +1237,9 @@ class CertificateEntry(object):
             x509 = X509()
             x509.parseBinary(certBytes)
             self.certificate = x509
+        elif self.certificateType == CertificateType.raw_public_key:
+            certBytes = parser.getVarBytes(3)
+            self.certificate = RawPublicKey(certBytes)
         else:
             raise ValueError("Set certificate type ({0}) unsupported"
                              .format(self.certificateType))
@@ -1193,6 +1334,22 @@ class Certificate(HandshakeMsg):
                 index += len(certBytes)+3
             if certificate_list:
                 self._cert_chain = X509CertChain(certificate_list)
+        elif self.certificateType == CertificateType.raw_public_key:
+            # RFC 7250: the payload is a single length-prefixed
+            # SubjectPublicKeyInfo (no certificate chain)
+            spkiLength = p.get(3)
+            if spkiLength == 0:
+                # empty certificate message (client has no certificate)
+                self._cert_chain = None
+            else:
+                spkiBytes = p.getFixBytes(spkiLength)
+                rpk = RawPublicKey()
+                try:
+                    rpk.parseBinary(spkiBytes)
+                except SyntaxError:
+                    raise BadCertificateError(
+                        "Raw public key could not be parsed")
+                self._cert_chain = X509CertChain([rpk])
         else:
             raise AssertionError()
 
@@ -1231,6 +1388,13 @@ class Certificate(HandshakeMsg):
             for cert in certificate_list:
                 bytes = cert.writeBytes()
                 w.addVarSeq(bytes, 1, 3)
+        elif self.certificateType == CertificateType.raw_public_key:
+            # RFC 7250: send just the SubjectPublicKeyInfo, no chain
+            if self._cert_chain and self._cert_chain.x509List:
+                spki = self._cert_chain.x509List[0].writeBytes()
+                w.addVarSeq(spki, 1, 3)
+            else:
+                w.add(0, 3)
         else:
             raise AssertionError()
         return w

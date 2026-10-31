@@ -19,7 +19,7 @@ from __future__ import division
 import time
 import socket
 from itertools import chain
-from tlslite.x509 import Credential
+from tlslite.x509 import Credential, RawPublicKey, X509
 from .utils.compat import formatExceptionTrace
 from .tlsrecordlayer import TLSRecordLayer
 from .session import Session, Ticket
@@ -491,7 +491,12 @@ class TLSConnection(TLSRecordLayer):
         if clientCertChain:
             if not isinstance(clientCertChain, X509CertChain):
                 raise ValueError("Unrecognized certificate type")
-            if "x509" not in settings.certificateTypes:
+            if isinstance(clientCertChain.x509List[0], RawPublicKey):
+                if "raw_public_key" not in \
+                        settings.client_certificate_types:
+                    raise ValueError("Client raw public key doesn't match "
+                                     "Handshake Settings")
+            elif "x509" not in settings.client_certificate_types:
                 raise ValueError("Client certificate doesn't match "
                                  "Handshake Settings")
 
@@ -646,7 +651,8 @@ class TLSConnection(TLSRecordLayer):
         for result in self._clientKeyExchange(settings, cipherSuite,
                                               clientCertChain,
                                               privateKey,
-                                              serverHello.certificate_type,
+                                              serverHello.server_certificate_type,
+                                              serverHello.client_certificate_type,
                                               serverHello.tackExt,
                                               clientHello.random,
                                               serverHello.random,
@@ -912,6 +918,17 @@ class TLSConnection(TLSRecordLayer):
                                serverName,
                                extensions=extensions)
 
+        # RFC 7250 raw public keys: advertise the certificate types we are
+        # willing to accept/send in preference order. The extensions are
+        # sent only for non-default configurations as their absence implies
+        # support for X.509 only (which keeps the default wire encoding).
+        if settings.server_certificate_types != ["x509"]:
+            clientHello.server_certificate_types = \
+                settings.getServerCertificateTypes()
+        if settings.client_certificate_types != ["x509"]:
+            clientHello.client_certificate_types = \
+                settings.getClientCertificateTypes()
+
         # Check if padding extension should be added
         # we want to add extensions even when using just SSLv3
         if settings.usePaddingExtension:
@@ -1148,6 +1165,35 @@ class TLSConnection(TLSRecordLayer):
                 AlertDescription.illegal_parameter,
                 "Server responded with incorrect certificate type"):
                 yield result
+        # RFC 7250: verify the selected certificate types were offered.
+        # In TLS 1.3 the selection is signalled in EncryptedExtensions,
+        # not in the ServerHello, so check it only for TLS 1.2 (a
+        # ServerHello carrying supported_versions is a TLS 1.3 hello).
+        # The server type applies only to certificate-authenticated
+        # suites and the client type only when the extension is present
+        # (i.e. client authentication will be requested)
+        if serverHello.getExtension(ExtensionType.supported_versions) \
+                is None:
+            cert_suite = serverHello.cipher_suite \
+                in CipherSuite.certAllSuites or \
+                serverHello.cipher_suite \
+                in CipherSuite.ecdheEcdsaSuites or \
+                serverHello.cipher_suite \
+                in CipherSuite.dheDsaSuites
+            if cert_suite and serverHello.server_certificate_type \
+                    not in clientHello.server_certificate_types:
+                for result in self._sendError(\
+                    AlertDescription.illegal_parameter,
+                    "Server responded with incorrect server certificate type"):
+                    yield result
+            if serverHello.getExtension(\
+                    ExtensionType.client_certificate_type) is not None and \
+                    serverHello.client_certificate_type \
+                    not in clientHello.client_certificate_types:
+                for result in self._sendError(\
+                    AlertDescription.illegal_parameter,
+                    "Server responded with incorrect client certificate type"):
+                    yield result
         if serverHello.compression_method != 0:
             for result in self._sendError(\
                 AlertDescription.illegal_parameter,
@@ -1350,6 +1396,36 @@ class TLSConnection(TLSRecordLayer):
         encrypted_extensions = result
         assert isinstance(encrypted_extensions, EncryptedExtensions)
 
+        # RFC 7250: certificate type negotiation happens in Encrypted
+        # Extensions for TLS 1.3. The server type is present only when the
+        # server sends a certificate (not with a PSK handshake) and the
+        # client type only when client authentication will be requested
+        if sr_psk is None:
+            server_certificate_type = \
+                encrypted_extensions.server_certificate_type
+            if server_certificate_type \
+                    not in clientHello.server_certificate_types:
+                for result in self._sendError(
+                        AlertDescription.illegal_parameter,
+                        "Server selected a server certificate type we did not "
+                        "advertise support for"):
+                    yield result
+        else:
+            server_certificate_type = CertificateType.x509
+        if encrypted_extensions.getExtension(\
+                ExtensionType.client_certificate_type) is not None:
+            client_certificate_type = \
+                encrypted_extensions.client_certificate_type
+            if client_certificate_type \
+                    not in clientHello.client_certificate_types:
+                for result in self._sendError(
+                        AlertDescription.illegal_parameter,
+                        "Server selected a client certificate type we did not "
+                        "advertise support for"):
+                    yield result
+        else:
+            client_certificate_type = CertificateType.x509
+
         size_limit_ext = encrypted_extensions.getExtension(
             ExtensionType.record_size_limit)
         if size_limit_ext and not settings.record_size_limit:
@@ -1400,7 +1476,7 @@ class TLSConnection(TLSRecordLayer):
 
         if not sr_psk:
             for result in self._getMsg(ContentType.handshake, expected_msg,
-                                       CertificateType.x509):
+                                       server_certificate_type):
                 if result in (0, 1):
                     yield result
                 else:
@@ -1418,7 +1494,7 @@ class TLSConnection(TLSRecordLayer):
                 # we got CertificateRequest so now we'll get Certificate or
                 # Compressed Certificate
                 for result in self._getMsg(ContentType.handshake, expected_msg,
-                                           CertificateType.x509):
+                                           server_certificate_type):
                     if result in (0, 1):
                         yield result
                     else:
@@ -1572,8 +1648,19 @@ class TLSConnection(TLSRecordLayer):
             if clientCertChain:
                 # Check to make sure we have the same type of certificates the
                 # server requested
-                if serverHello.certificate_type == CertificateType.x509 \
-                    and not isinstance(clientCertChain, X509CertChain):
+                if client_certificate_type == CertificateType.x509 \
+                    and (not isinstance(clientCertChain, X509CertChain) or
+                         not clientCertChain.x509List or
+                         not isinstance(clientCertChain.x509List[0], X509)):
+                    for result in self._sendError(
+                            AlertDescription.handshake_failure,
+                            "Client certificate is of wrong type"):
+                        yield result
+                if client_certificate_type == \
+                        CertificateType.raw_public_key \
+                    and (not clientCertChain.x509List or
+                         not isinstance(clientCertChain.x509List[0],
+                                        RawPublicKey)):
                     for result in self._sendError(
                             AlertDescription.handshake_failure,
                             "Client certificate is of wrong type"):
@@ -1582,7 +1669,7 @@ class TLSConnection(TLSRecordLayer):
             client_certificate = self._create_cert_msg(
                 "client", certificate_request,
                 settings.certificate_compression_send, clientCertChain,
-                serverHello.certificate_type, version=self.version)
+                client_certificate_type, version=self.version)
 
             # we need to send the message even if we don't have a certificate
             for result in self._sendMsg(client_certificate):
@@ -1818,7 +1905,8 @@ class TLSConnection(TLSRecordLayer):
 
     def _clientKeyExchange(self, settings, cipherSuite,
                            clientCertChain, privateKey,
-                           certificateType,
+                           serverCertificateType,
+                           clientCertificateType,
                            tackExt, clientRandom, serverRandom,
                            keyExchange):
         """Perform the client side of key exchange"""
@@ -1828,7 +1916,7 @@ class TLSConnection(TLSRecordLayer):
                 cipherSuite in CipherSuite.dheDsaSuites:
             for result in self._getMsg(ContentType.handshake,
                                        HandshakeType.certificate,
-                                       certificateType):
+                                       serverCertificateType):
                 if result in (0, 1):
                     yield result
                 else: break
@@ -1955,8 +2043,18 @@ class TLSConnection(TLSRecordLayer):
             if clientCertChain:
                 #Check to make sure we have the same type of
                 #certificates the server requested
-                if certificateType == CertificateType.x509 \
-                    and not isinstance(clientCertChain, X509CertChain):
+                if clientCertificateType == CertificateType.x509 \
+                    and (not isinstance(clientCertChain, X509CertChain) or
+                         not clientCertChain.x509List or
+                         not isinstance(clientCertChain.x509List[0], X509)):
+                    for result in self._sendError(\
+                            AlertDescription.handshake_failure,
+                            "Client certificate is of wrong type"):
+                        yield result
+                if clientCertificateType == CertificateType.raw_public_key \
+                    and (not clientCertChain.x509List or
+                         not isinstance(clientCertChain.x509List[0],
+                                        RawPublicKey)):
                     for result in self._sendError(\
                             AlertDescription.handshake_failure,
                             "Client certificate is of wrong type"):
@@ -1965,7 +2063,7 @@ class TLSConnection(TLSRecordLayer):
             clientCertificate = self._create_cert_msg(
                 "client", certificateRequest,
                 settings.certificate_compression_send, clientCertChain,
-                certificateType)
+                clientCertificateType)
             # we need to send the message even if we don't have a certificate
             for result in self._sendMsg(clientCertificate):
                 yield result
@@ -2321,6 +2419,24 @@ class TLSConnection(TLSRecordLayer):
         for result in self._handshakeWrapperAsync(handshaker, checker):
             yield result
 
+    @staticmethod
+    def _negotiate_certificate_type(offered, supported):
+        """
+        Select a certificate type (RFC 7250) common to both sides.
+
+        The first type in the client's preference list :py:obj:`offered`
+        that is also present in the locally :py:obj:`supported` list is
+        selected. Returns None when there is no overlap.
+
+        :param list offered: certificate types advertised by the client
+        :param list supported: certificate types configured locally
+        :rtype: int or None
+        """
+        for cert_type in offered:
+            if cert_type in supported:
+                return cert_type
+        return None
+
 
     def _handshakeServerAsyncHelper(self, verifierDB,
                                     cert_chain, privateKey, reqCert,
@@ -2345,6 +2461,11 @@ class TLSConnection(TLSRecordLayer):
             raise ValueError("Caller passed reqCAs but not reqCert")
         if cert_chain and not isinstance(cert_chain, X509CertChain):
             raise ValueError("Unrecognized certificate type")
+        if cert_chain and cert_chain.x509List and \
+                isinstance(cert_chain.x509List[0], RawPublicKey) and \
+                "raw_public_key" not in settings.server_certificate_types:
+            raise ValueError("Server raw public key doesn't match "
+                             "Handshake Settings")
         if activationFlags and not tacks:
             raise ValueError("Nonzero activationFlags requires tacks")
         if tacks:
@@ -2371,7 +2492,7 @@ class TLSConnection(TLSRecordLayer):
                 return # Handshake was resumed, we're done
             else: break
         (clientHello, version, cipherSuite, sig_scheme, privateKey,
-            cert_chain) = result
+            cert_chain, srv_cert_type, cli_cert_type) = result
 
         # in TLS 1.3 the handshake is completely different
         # (extensions go into different messages, format of messages is
@@ -2382,7 +2503,9 @@ class TLSConnection(TLSRecordLayer):
                                                      privateKey, cert_chain,
                                                      version, sig_scheme,
                                                      alpn, reqCert, dc_key,
-                                                     del_cred):
+                                                     del_cred,
+                                                     srv_cert_type,
+                                                     cli_cert_type):
                 if result in (0, 1):
                     yield result
                 else:
@@ -2511,6 +2634,14 @@ class TLSConnection(TLSRecordLayer):
         if not extensions:
             extensions = None
 
+        # if client authentication will be requested, both certificate
+        # directions need a mutually supported type (RFC 7250)
+        if reqCert and cli_cert_type is None:
+            for result in self._sendError(
+                    AlertDescription.unsupported_certificate,
+                    "No common client certificate type"):
+                yield result
+
         serverHello = ServerHello()
         # RFC 8446, section 4.1.3
         random = getRandomBytes(32)
@@ -2521,6 +2652,17 @@ class TLSConnection(TLSRecordLayer):
         serverHello.create(self.version, random, sessionID,
                            cipherSuite, CertificateType.x509, tackExt,
                            nextProtos, extensions=extensions)
+        # RFC 7250: echo the selected certificate types in ServerHello
+        # (X.509 selections are implicit so no extension is sent). The
+        # server type is relevant only for certificate-authenticated
+        # cipher suites; PSK/anonymous handshakes carry no Certificate
+        cert_suite = cipherSuite in CipherSuite.certAllSuites or \
+            cipherSuite in CipherSuite.ecdheEcdsaSuites or \
+            cipherSuite in CipherSuite.dheDsaSuites
+        if cert_suite:
+            serverHello.server_certificate_type = srv_cert_type
+        if reqCert:
+            serverHello.client_certificate_type = cli_cert_type
 
         # Perform the SRP key exchange
         clientCertChain = None
@@ -2528,7 +2670,8 @@ class TLSConnection(TLSRecordLayer):
             for result in self._serverSRPKeyExchange(clientHello, serverHello,
                                                      verifierDB, cipherSuite,
                                                      privateKey, cert_chain,
-                                                     settings):
+                                                     settings,
+                                                     srv_cert_type):
                 if result in (0, 1):
                     yield result
                 else: break
@@ -2581,7 +2724,8 @@ class TLSConnection(TLSRecordLayer):
             for result in self._serverCertKeyExchange(clientHello, serverHello,
                                         sig_hash_alg, cert_chain, keyExchange,
                                         reqCert, reqCAs, cipherSuite,
-                                        settings):
+                                        settings, srv_cert_type,
+                                        cli_cert_type):
                 if result in (0,1): yield result
                 else: break
             (premasterSecret, clientCertChain) = result
@@ -2866,7 +3010,8 @@ class TLSConnection(TLSRecordLayer):
 
     def _serverTLS13Handshake(self, settings, clientHello, cipherSuite,
                               privateKey, serverCertChain, version, scheme,
-                              srv_alpns, reqCert, dc_key, del_cred):
+                              srv_alpns, reqCert, dc_key, del_cred,
+                              srv_cert_type, cli_cert_type):
         """Perform a TLS 1.3 handshake"""
         prf_name, prf_size = self._getPRFParams(cipherSuite)
         cert_req_comp_cert_ext = None
@@ -3057,7 +3202,32 @@ class TLSConnection(TLSRecordLayer):
 
         self._changeWriteState()
 
+        # RFC 7250: without PSK the server sends its certificate, so a
+        # common server certificate type is required; with client
+        # authentication a common client certificate type is required too
+        if selected_psk is None and srv_cert_type is None:
+            for result in self._sendError(
+                    AlertDescription.unsupported_certificate,
+                    "No common server certificate type"):
+                yield result
+        if reqCert and cli_cert_type is None:
+            for result in self._sendError(
+                    AlertDescription.unsupported_certificate,
+                    "No common client certificate type"):
+                yield result
+
         ee_extensions = []
+
+        # RFC 7250: advertise the selected certificate types (X.509 is the
+        # implicit default, so the extension is sent only for raw keys);
+        # the server type is relevant only when a Certificate follows
+        if selected_psk is None and \
+                srv_cert_type == CertificateType.raw_public_key:
+            ee_extensions.append(
+                SrvServerCertificateTypeExtension().create(srv_cert_type))
+        if reqCert and cli_cert_type == CertificateType.raw_public_key:
+            ee_extensions.append(
+                SrvClientCertificateTypeExtension().create(cli_cert_type))
 
         if clientHello.getExtension(ExtensionType.record_size_limit) and \
                 settings.record_size_limit:
@@ -3140,7 +3310,7 @@ class TLSConnection(TLSRecordLayer):
 
             certificate = self._create_cert_msg(
                 "server", clientHello, settings.certificate_compression_send,
-                serverCertChain, CertificateType.x509, bytearray(),
+                serverCertChain, srv_cert_type, bytearray(),
                 self.version, extensions)
             self._queue_message(certificate)
 
@@ -3244,7 +3414,7 @@ class TLSConnection(TLSRecordLayer):
                 expected_msg = (HandshakeType.certificate)
 
             for result in self._getMsg(ContentType.handshake, expected_msg,
-                                       CertificateType.x509):
+                                       cli_cert_type):
                 if result in (0, 1):
                     yield result
                 else:
@@ -4110,6 +4280,36 @@ class TLSConnection(TLSRecordLayer):
                     "the client doesn't support my certificate type"):
                 yield result
 
+        # RFC 7250: negotiate the raw public key / X.509 certificate types
+        # for both directions, honouring the client's preference order
+        # the server can only send the type of the chain it is configured
+        # with (provided it was enabled in settings)
+        configured_srv_types = settings.getServerCertificateTypes()
+        if cert_chain is not None and cert_chain.x509List:
+            configured_type = CertificateType.raw_public_key \
+                if isinstance(cert_chain.x509List[0], RawPublicKey) \
+                else CertificateType.x509
+            configured_srv_types = [t for t in configured_srv_types
+                                    if t == configured_type]
+        srv_cert_type = self._negotiate_certificate_type(
+            clientHello.server_certificate_types,
+            configured_srv_types)
+        cli_cert_type = self._negotiate_certificate_type(
+            clientHello.client_certificate_types,
+            settings.getClientCertificateTypes())
+
+        # a certificate authenticated handshake needs a common server
+        # certificate type (TLS 1.3 re-checks this after PSK selection)
+        if version <= (3, 3) and \
+                (cipherSuite in CipherSuite.certAllSuites or
+                 cipherSuite in CipherSuite.ecdheEcdsaSuites or
+                 cipherSuite in CipherSuite.dheDsaSuites) and \
+                srv_cert_type is None:
+            for result in self._sendError(
+                    AlertDescription.unsupported_certificate,
+                    "No common server certificate type"):
+                yield result
+
         # when we have selected TLS 1.3, check if we don't have to ask for
         # a new client hello
         if version > (3, 3):
@@ -4306,12 +4506,12 @@ class TLSConnection(TLSRecordLayer):
         # the client's session_id was not found in cache:
 #pylint: disable = undefined-loop-variable
         yield (clientHello, version, cipherSuite, sig_scheme, private_key,
-               cert_chain)
+               cert_chain, srv_cert_type, cli_cert_type)
 #pylint: enable = undefined-loop-variable
 
     def _serverSRPKeyExchange(self, clientHello, serverHello, verifierDB,
                               cipherSuite, privateKey, serverCertChain,
-                              settings):
+                              settings, serverCertificateType):
         """Perform the server side of SRP key exchange"""
         try:
             sigHash, serverCertChain, privateKey = \
@@ -4358,7 +4558,7 @@ class TLSConnection(TLSRecordLayer):
         if cipherSuite in CipherSuite.srpCertSuites:
             certificateMsg = self._create_cert_msg(
                 "server", clientHello, settings.certificate_compression_send,
-                serverCertChain, CertificateType.x509)
+                serverCertChain, serverCertificateType)
             msgs.append(certificateMsg)
         msgs.append(serverKeyExchange)
         msgs.append(ServerHelloDone())
@@ -4526,6 +4726,11 @@ class TLSConnection(TLSRecordLayer):
             if cert:
                 cert_chain_ok = True
                 for i in range(len(cert.x509List)):
+                    # raw public keys carry no wrapper signature, so
+                    # there is no certificate signature algorithm to
+                    # negotiate for them
+                    if isinstance(cert.x509List[i], RawPublicKey):
+                        continue
                     if cert.x509List[i].issuer != cert.x509List[i].subject:
                         if cert.x509List[i].sigalg not in client_sigalgs:
                             cert_chain_ok = False
@@ -4546,7 +4751,8 @@ class TLSConnection(TLSRecordLayer):
     def _serverCertKeyExchange(self, clientHello, serverHello, sigHashAlg,
                                 serverCertChain, keyExchange,
                                 reqCert, reqCAs, cipherSuite,
-                                settings):
+                                settings, serverCertificateType,
+                                clientCertificateType):
         #Send ServerHello, Certificate or Compressed Certificate
         #[, ServerKeyExchange] [, CertificateRequest], ServerHelloDone
         msgs = []
@@ -4574,12 +4780,12 @@ class TLSConnection(TLSRecordLayer):
             self.server_cert_compression_algo = \
                 CertificateCompressionAlgorithm.toStr(
                     chosen_compression_algo)
-            certificate = CompressedCertificate(CertificateType.x509,
+            certificate = CompressedCertificate(serverCertificateType,
                                                 self.version)
             certificate.create(chosen_compression_algo, serverCertChain,
                                bytearray())
         else:
-            certificate = Certificate(CertificateType.x509, self.version)
+            certificate = Certificate(serverCertificateType, self.version)
             certificate.create(serverCertChain, bytearray())
 
         msgs.append(certificate)
@@ -4648,7 +4854,7 @@ class TLSConnection(TLSRecordLayer):
                 for result in self._getMsg((ContentType.handshake,
                                            ContentType.alert),
                                            HandshakeType.certificate,
-                                           CertificateType.x509):
+                                           clientCertificateType):
                     if result in (0,1): yield result
                     else: break
                 msg = result
@@ -4670,7 +4876,7 @@ class TLSConnection(TLSRecordLayer):
             elif self.version in ((3,1), (3,2), (3,3)):
                 for result in self._getMsg(ContentType.handshake,
                                           HandshakeType.certificate,
-                                          CertificateType.x509):
+                                          clientCertificateType):
                     if result in (0,1): yield result
                     else: break
                 clientCertificate = result

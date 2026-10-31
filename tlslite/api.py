@@ -16,7 +16,7 @@ from .session import Session
 from .sessioncache import SessionCache
 from .tlsconnection import TLSConnection
 from .verifierdb import VerifierDB
-from .x509 import X509
+from .x509 import X509, RawPublicKey
 from .x509certchain import X509CertChain
 
 from .integration.httptlsconnection import HTTPTLSConnection

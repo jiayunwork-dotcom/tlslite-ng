@@ -93,7 +93,7 @@ class TLSExtension(object):
     # actual definition at the end of file, after definitions of all classes
     _universalExtensions = {}
     _serverExtensions = {}
-    # _encryptedExtensions = {}
+    _encryptedExtensions = {}
     _certificateExtensions = {}
     _hrrExtensions = {}
 
@@ -230,7 +230,7 @@ class TLSExtension(object):
 
             for handler_t, handlers in (
                     (self.cert, self._certificateExtensions),
-                    # (self.encExtType, self._encryptedExtensions),
+                    (self.encExtType, self._encryptedExtensions),
                     (self.serverType, self._serverExtensions),
                     (self.hrr, self._hrrExtensions),
                     (True, self._universalExtensions)):
@@ -1005,6 +1005,100 @@ class ServerCertTypeExtension(IntExtension):
         if not parser.getRemainingLength():
             raise DecodeError("Empty payload in extension")
         return super(ServerCertTypeExtension, self).parse(parser)
+
+
+class ClientCertificateTypeExtension(VarListExtension):
+    """
+    Client side of the client_certificate_type extension from RFC 7250.
+
+    Sent by the client in ClientHello to advertise the certificate types
+    it is willing to send as a client, in the order of preference.
+
+    :vartype certTypes: list of int
+    :ivar certTypes: list of certificate type identifiers (each one byte)
+    """
+
+    def __init__(self):
+        """Create an instance of the extension."""
+        super(ClientCertificateTypeExtension, self).__init__(
+            1, 1, 'certTypes',
+            ExtensionType.client_certificate_type,
+            CertificateType)
+
+
+class ServerCertificateTypeExtension(VarListExtension):
+    """
+    Client side of the server_certificate_type extension from RFC 7250.
+
+    Sent by the client in ClientHello to advertise the certificate types
+    it is willing to accept from a server, in the order of preference.
+
+    :vartype certTypes: list of int
+    :ivar certTypes: list of certificate type identifiers (each one byte)
+    """
+
+    def __init__(self):
+        """Create an instance of the extension."""
+        super(ServerCertificateTypeExtension, self).__init__(
+            1, 1, 'certTypes',
+            ExtensionType.server_certificate_type,
+            CertificateType)
+
+
+class SrvClientCertificateTypeExtension(IntExtension):
+    """
+    Server side of the client_certificate_type extension from RFC 7250.
+
+    Sent by the server in ServerHello (TLS 1.2) or EncryptedExtensions
+    (TLS 1.3) to notify the client of the certificate type selected for
+    the client certificate.
+
+    :vartype cert_type: int
+    :ivar cert_type: the certificate type selected by server
+    """
+
+    def __init__(self):
+        """Create an instance of the extension."""
+        super(SrvClientCertificateTypeExtension, self).__init__(
+            1, 'cert_type',
+            ext_type=ExtensionType.client_certificate_type,
+            item_enum=CertificateType)
+        self.serverType = True
+
+    def parse(self, parser):
+        """Parse the extension from on the wire format."""
+        # generic code allows empty, this ext does not
+        if not parser.getRemainingLength():
+            raise DecodeError("Empty payload in extension")
+        return super(SrvClientCertificateTypeExtension, self).parse(parser)
+
+
+class SrvServerCertificateTypeExtension(IntExtension):
+    """
+    Server side of the server_certificate_type extension from RFC 7250.
+
+    Sent by the server in ServerHello (TLS 1.2) or EncryptedExtensions
+    (TLS 1.3) to notify the client of the certificate type selected for
+    the server certificate.
+
+    :vartype cert_type: int
+    :ivar cert_type: the certificate type selected by server
+    """
+
+    def __init__(self):
+        """Create an instance of the extension."""
+        super(SrvServerCertificateTypeExtension, self).__init__(
+            1, 'cert_type',
+            ext_type=ExtensionType.server_certificate_type,
+            item_enum=CertificateType)
+        self.serverType = True
+
+    def parse(self, parser):
+        """Parse the extension from on the wire format."""
+        # generic code allows empty, this ext does not
+        if not parser.getRemainingLength():
+            raise DecodeError("Empty payload in extension")
+        return super(SrvServerCertificateTypeExtension, self).parse(parser)
 
 
 class SRPExtension(TLSExtension):
@@ -2224,6 +2318,8 @@ TLSExtension._universalExtensions = {
     ExtensionType.server_name: SNIExtension,
     ExtensionType.status_request: StatusRequestExtension,
     ExtensionType.cert_type: ClientCertTypeExtension,
+    ExtensionType.client_certificate_type: ClientCertificateTypeExtension,
+    ExtensionType.server_certificate_type: ServerCertificateTypeExtension,
     ExtensionType.supported_groups: SupportedGroupsExtension,
     ExtensionType.ec_point_formats: ECPointFormatsExtension,
     ExtensionType.srp: SRPExtension,
@@ -2248,10 +2344,19 @@ TLSExtension._universalExtensions = {
 
 TLSExtension._serverExtensions = {
     ExtensionType.cert_type: ServerCertTypeExtension,
+    ExtensionType.client_certificate_type: SrvClientCertificateTypeExtension,
+    ExtensionType.server_certificate_type: SrvServerCertificateTypeExtension,
     ExtensionType.tack: TACKExtension,
     ExtensionType.key_share: ServerKeyShareExtension,
     ExtensionType.supported_versions: SrvSupportedVersionsExtension,
     ExtensionType.pre_shared_key: SrvPreSharedKeyExtension
+}
+
+# EncryptedExtensions (TLS 1.3) use the same server (single value) form of
+# the RFC 7250 certificate type extensions as ServerHello
+TLSExtension._encryptedExtensions = {
+    ExtensionType.client_certificate_type: SrvClientCertificateTypeExtension,
+    ExtensionType.server_certificate_type: SrvServerCertificateTypeExtension
 }
 
 TLSExtension._certificateExtensions = {

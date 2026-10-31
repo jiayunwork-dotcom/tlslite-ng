@@ -29,6 +29,8 @@ KEY_EXCHANGE_NAMES = ["ecdhe_ecdsa", "rsa", "dhe_rsa", "ecdhe_rsa", "srp_sha",
                       "srp_sha_rsa", "ecdh_anon", "dh_anon", "dhe_dsa"]
 CIPHER_IMPLEMENTATIONS = ["openssl", "pycrypto", "python"]
 CERTIFICATE_TYPES = ["x509"]
+# certificate type names supported by the RFC 7250 extensions
+CERTIFICATE_TYPE_NAMES = ["x509", "raw_public_key"]
 RSA_SIGNATURE_HASHES = ["sha512", "sha384", "sha256", "sha224", "sha1"]
 DSA_SIGNATURE_HASHES = ["sha512", "sha384", "sha256", "sha224", "sha1"]
 ECDSA_SIGNATURE_HASHES = ["sha512", "sha384", "sha256", "sha224", "sha1"]
@@ -447,6 +449,9 @@ class HandshakeSettings(object):
     def _init_misc_extensions(self):
         """Default variables for assorted extensions."""
         self.certificateTypes = list(CERTIFICATE_TYPES)
+        # RFC 7250 raw public key support, separate for both directions
+        self.server_certificate_types = ["x509"]
+        self.client_certificate_types = ["x509"]
         self.useExperimentalTackExtension = False
         self.sendFallbackSCSV = False
         self.useEncryptThenMAC = True
@@ -611,6 +616,23 @@ class HandshakeSettings(object):
         if unknownType:
             raise ValueError("Unknown certificate type: {0}"
                              .format(unknownType))
+
+        unknownType = not_matching(other.server_certificate_types,
+                                   CERTIFICATE_TYPE_NAMES)
+        if unknownType:
+            raise ValueError("Unknown server certificate type: {0}"
+                             .format(unknownType))
+
+        unknownType = not_matching(other.client_certificate_types,
+                                   CERTIFICATE_TYPE_NAMES)
+        if unknownType:
+            raise ValueError("Unknown client certificate type: {0}"
+                             .format(unknownType))
+
+        if not other.server_certificate_types:
+            raise ValueError("No supported server certificate types")
+        if not other.client_certificate_types:
+            raise ValueError("No supported client certificate types")
 
         unknownSigHash = not_matching(other.rsaSigHashes,
                                       ALL_RSA_SIGNATURE_HASHES)
@@ -836,6 +858,8 @@ class HandshakeSettings(object):
         other.minKeySize = self.minKeySize
         other.maxKeySize = self.maxKeySize
         other.certificateTypes = self.certificateTypes
+        other.server_certificate_types = self.server_certificate_types
+        other.client_certificate_types = self.client_certificate_types
         other.rsaSigHashes = self.rsaSigHashes
         other.rsaSchemes = self.rsaSchemes
         other.dsaSigHashes = self.dsaSigHashes
@@ -900,6 +924,27 @@ class HandshakeSettings(object):
         for ct in self.certificateTypes:
             if ct == "x509":
                 ret.append(CertificateType.x509)
+            else:
+                raise AssertionError()
+        return ret
+
+    def getServerCertificateTypes(self):
+        """Get list of server certificate types as IDs (RFC 7250)"""
+        return self._getCertificateTypeNames(self.server_certificate_types)
+
+    def getClientCertificateTypes(self):
+        """Get list of client certificate types as IDs (RFC 7250)"""
+        return self._getCertificateTypeNames(self.client_certificate_types)
+
+    @staticmethod
+    def _getCertificateTypeNames(names):
+        """Convert certificate type names to their numeric identifiers."""
+        ret = []
+        for ct in names:
+            if ct == "x509":
+                ret.append(CertificateType.x509)
+            elif ct == "raw_public_key":
+                ret.append(CertificateType.raw_public_key)
             else:
                 raise AssertionError()
         return ret

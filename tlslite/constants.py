@@ -75,6 +75,7 @@ class TLSEnum(object):
 class CertificateType(TLSEnum):
     x509 = 0
     openpgp = 1
+    raw_public_key = 2  # RFC 7250
 
 
 class ClientCertificateType(TLSEnum):
@@ -161,6 +162,8 @@ class ExtensionType(TLSEnum):
     status_request = 5  # RFC 6066 / 4366
     cert_type = 9  # RFC 6091
     supported_groups = 10  # RFC 4492, RFC-ietf-tls-negotiated-ff-dhe-10
+    client_certificate_type = 19  # RFC 7250
+    server_certificate_type = 20  # RFC 7250
     ec_point_formats = 11  # RFC 4492
     srp = 12  # RFC 5054
     signature_algorithms = 13  # RFC 5246

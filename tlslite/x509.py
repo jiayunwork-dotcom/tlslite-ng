@@ -191,6 +191,124 @@ class X509(object):
         return self.bytes
 
 
+class RawPublicKey(object):
+    """
+    This class represents a raw public key as defined in RFC 7250.
+
+    It wraps a DER-encoded SubjectPublicKeyInfo (the same structure that is
+    embedded in an X.509 certificate) without any certificate wrapper,
+    signature or chain. Instances can be placed in an
+    :py:class:`tlslite.x509certchain.X509CertChain` (with a single element)
+    and used wherever an X.509 certificate chain is accepted.
+
+    :vartype bytes: bytearray
+    :ivar bytes: The DER-encoded ASN.1 SubjectPublicKeyInfo
+
+    :vartype publicKey: ~tlslite.utils.rsakey.RSAKey
+    :ivar publicKey: The public key represented by the SubjectPublicKeyInfo.
+
+    :vartype certAlg: str
+    :ivar certAlg: algorithm of the public key, "rsa" for RSASSA-PKCS#1 v1.5,
+        "rsa-pss" for RSASSA-PSS, "ecdsa" for ECDSA
+    """
+
+    def __init__(self, spki_bytes=None):
+        """Create empty raw public key object, optionally parsing given SPKI.
+
+        :type spki_bytes: bytes-like
+        :param spki_bytes: DER-encoded SubjectPublicKeyInfo
+        """
+        self.bytes = bytearray(0)
+        self.publicKey = None
+        self.certAlg = None
+        self.subject_public_key = None
+        if spki_bytes is not None:
+            self.parseBinary(spki_bytes)
+
+    def parseBinary(self, spki_bytes):
+        """
+        Parse a DER-encoded SubjectPublicKeyInfo.
+
+        :type spki_bytes: bytes-like
+        :param spki_bytes: A DER-encoded SubjectPublicKeyInfo.
+        """
+        self.bytes = bytearray(spki_bytes)
+        parser = ASN1Parser(self.bytes)
+
+        alg_identifier = parser.getChild(0)
+        alg_identifier_len = alg_identifier.getChildCount()
+
+        self.certAlg = get_algorithm(alg_identifier)
+
+        # for RSA the parameters of AlgorithmIdentifier should be a NULL
+        if self.certAlg == "rsa":
+            if alg_identifier_len != 2:
+                raise SyntaxError("Missing parameters in AlgorithmIdentifier")
+            params = alg_identifier.getChild(1)
+            if params.value != bytearray(0):
+                raise SyntaxError(
+                    "Unexpected non-NULL parameters in "
+                    "AlgorithmIdentifier"
+                )
+        elif self.certAlg == "ecdsa":
+            self.publicKey = _ecdsa_pubkey_parsing(self.bytes)
+            return self
+        elif self.certAlg == "dsa":
+            self.publicKey = _dsa_pubkey_parsing(parser)
+            return self
+        elif self.certAlg == "Ed25519" or self.certAlg == "Ed448":
+            self.publicKey = _eddsa_pubkey_parsing(self.bytes)
+            return self
+        elif self.certAlg in ("mldsa44", "mldsa65", "mldsa87"):
+            self.publicKey = _mldsa_pubkey_parsing(self.bytes)
+            return self
+        else:  # rsa-pss
+            pass  # ignore parameters, if any
+
+        self.publicKey, self.subject_public_key = _rsa_pubkey_parsing(
+            parser, self.certAlg
+        )
+        return self
+
+    def getFingerprint(self):
+        """
+        Get the hex-encoded SHA-256 fingerprint of the raw public key.
+
+        Unlike X.509 certificates (which use SHA-1 for backwards
+        compatibility), the fingerprint of a raw public key is computed
+        with SHA-256 over the whole SubjectPublicKeyInfo, as used by
+        the spkiFingerprint Checker parameter.
+
+        :rtype: str
+        :returns: A hex-encoded fingerprint.
+        """
+        return b2a_hex(secureHash(self.bytes, 'sha256'))
+
+    def writeBytes(self):
+        """Serialise object to a DER encoded string."""
+        return self.bytes
+
+    def __hash__(self):
+        """Calculate hash of object."""
+        return hash(bytes(self.bytes))
+
+    def __eq__(self, other):
+        """Compare other object for equality."""
+        if not hasattr(other, "bytes"):
+            return NotImplemented
+        return self.bytes == other.bytes
+
+    def __ne__(self, other):
+        """Compare with other object for inequality."""
+        if not hasattr(other, "bytes"):
+            return NotImplemented
+        return not self == other
+
+    def __repr__(self):
+        return "RawPublicKey(certAlg={0!r}, bytes={1!r})".format(
+            self.certAlg, self.bytes)
+
+
 def get_algorithm(alg_identifier):
     """
     Retrive the algoritm from the AlgorithmIdentifier
